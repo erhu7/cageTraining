@@ -60,7 +60,7 @@ const CONFIG = {
   ITI_MS:          1500,       // blank time between trials
   MAX_TRIALS:      0,          // 0 = run until stopped
   REWARD_URL:      null,       // e.g. "/reward" -> server fires the juice pump
-  USE_ARDUINO:     true,       // LED on for REWARD_MS on each correct trial (Web Serial over USB, or Bluetooth on Android)
+  USE_ARDUINO:     true,       // LED on for REWARD_MS on each correct trial (Web Serial, or WebUSB on Android)
   ARDUINO_BAUD:    9600,       // must match Serial.begin(...) in the Arduino sketch
   LOG_URL:         "/log",     // where each trial is POSTed (set null to disable)
   SUBJECT:         "monkeyX"   // goes into the data file
@@ -188,19 +188,15 @@ function giveReward() {
   }
 }
 
-/* Arduino LED: '1' = LED on, '0' = LED off (same as arduino_test.html).
-   Desktop Chrome/Edge 89+ have Web Serial, so a USB cable works there. Chrome on Android
-   has no Web Serial (and can't claim the board over WebUSB), so there we use Bluetooth;
-   the sketch in arduino/cage_led/ listens on both. Both need https (or localhost). */
-const BLE_SERVICE = "19b10000-e8f2-537e-4f6c-d104768a1214";   // must match cage_led.ino
-const BLE_LED     = "19b10001-e8f2-537e-4f6c-d104768a1214";
-
+/* Arduino LED over USB serial: '1' = LED on, '0' = LED off (same as arduino_test.html).
+   Desktop Chrome/Edge 89+ have Web Serial. Chrome on Android doesn't, so there we use
+   WebUSB and talk to the board's USB-serial (CDC-ACM) chip directly. Both need https. */
 async function connectArduino() {
   if (!CONFIG.USE_ARDUINO || arduino) return;
   try {
-    if (navigator.serial)         arduino = await connectWebSerial();
-    else if (navigator.bluetooth) arduino = await connectBluetooth();
-    else throw new Error("this browser has neither Web Serial nor Web Bluetooth (needs Chrome over https)");
+    if (navigator.serial)   arduino = await connectWebSerial();
+    else if (navigator.usb) arduino = await connectWebUSB();
+    else throw new Error("this browser has neither Web Serial nor WebUSB (needs Chrome over https)");
     arduinoError = "";
   } catch (e) {
     console.log("arduino not connected", e);
@@ -216,27 +212,41 @@ async function connectWebSerial() {
   return port.writable.getWriter();
 }
 
-async function connectBluetooth() {
-  // Picker only lists boards running cage_led.ino (they advertise BLE_SERVICE)
-  const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [BLE_SERVICE] }] });
-  const writer = await openBluetooth(device);
-  device.addEventListener("gattserverdisconnected", async () => {
-    arduino = null;                         // stop writing until we're back
-    console.log("arduino bluetooth disconnected - reconnecting");
-    for (let i = 0; i < 5 && !arduino; i++) {
-      await new Promise(r => setTimeout(r, 1000));
-      try { arduino = await openBluetooth(device); } catch (e) { console.log("reconnect fail", e); }
-    }
-  });
-  return writer;
-}
+async function connectWebUSB() {
+  // Reuse a device this page was already given permission for; otherwise show the picker
+  const devices = await navigator.usb.getDevices();
+  const device = devices[0] || await navigator.usb.requestDevice({ filters: [] });
+  await device.open();
+  if (device.configuration === null) await device.selectConfiguration(1);
 
-async function openBluetooth(device) {
-  const server  = await device.gatt.connect();
-  const service = await server.getPrimaryService(BLE_SERVICE);
-  const led     = await service.getCharacteristic(BLE_LED);
+  // A USB-serial (CDC-ACM) device has a control interface (class 2) and a data interface
+  // (class 10) with a bulk OUT endpoint that the bytes are written to.
+  let control = null, data = null, outEndpoint = null;
+  for (const iface of device.configuration.interfaces) {
+    const alt = iface.alternates[0];
+    if (alt.interfaceClass === 2 && !control) control = iface;
+    if (alt.interfaceClass === 10 && !data) {
+      const ep = alt.endpoints.find(ep => ep.direction === "out" && ep.type === "bulk");
+      if (ep) { data = iface; outEndpoint = ep.endpointNumber; }
+    }
+  }
+  if (!data) throw new Error("not a USB-serial (CDC-ACM) board - CH340/CP2102 clones don't work over WebUSB");
+
+  await device.claimInterface(data.interfaceNumber);
+  if (control) {
+    await device.claimInterface(control.interfaceNumber);
+    const setup = (request, value) =>
+      ({ requestType: "class", recipient: "interface", request: request, value: value, index: control.interfaceNumber });
+    const lineCoding = new DataView(new ArrayBuffer(7));
+    lineCoding.setUint32(0, CONFIG.ARDUINO_BAUD, true);  // baud rate
+    lineCoding.setUint8(4, 0);                           // 1 stop bit
+    lineCoding.setUint8(5, 0);                           // no parity
+    lineCoding.setUint8(6, 8);                           // 8 data bits
+    await device.controlTransferOut(setup(0x20, 0), lineCoding.buffer);  // SET_LINE_CODING
+    await device.controlTransferOut(setup(0x22, 0x03));                  // SET_CONTROL_LINE_STATE: DTR + RTS on
+  }
   // Same write() shape as a Web Serial writer, so arduinoSend() works with either
-  return { write: (bytes) => led.writeValue(bytes) };
+  return { write: (bytes) => device.transferOut(outEndpoint, bytes) };
 }
 
 function arduinoSend(text) {
@@ -285,7 +295,7 @@ function downloadCSV() {
    ===================================================== */
 let arduinoWarned = false;
 // "click", not "pointerdown": on touchscreens only the finger lifting counts as a user
-// gesture, and the device picker + fullscreen are refused without one.
+// gesture, and the USB picker + fullscreen are refused without one.
 document.getElementById("start").addEventListener("click", async () => {
   // Browsers only allow sound + fullscreen after a user touch, so we do it here.
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
