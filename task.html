@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Dot Touch Task</title>
+
+<style>
+  /* ---------- LOOK OF THE PAGE (CSS) ---------- */
+  html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    background: black;
+    overflow: hidden;              /* no scrollbars */
+    touch-action: none;            /* stop pinch-zoom / scrolling / pull-to-refresh */
+    overscroll-behavior: none;
+    user-select: none;             /* no text selection / long-press menus */
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;   /* no iOS long-press popup during holds */
+    -webkit-tap-highlight-color: transparent;
+  }
+  #stage {                         /* the full-screen playing field */
+    position: fixed; inset: 0;
+  }
+  #dot {                           /* the target */
+    position: absolute;
+    border-radius: 50%;            /* makes a square into a circle */
+    display: none;
+  }
+  #start {                         /* experimenter start screen */
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: red; font: 32px sans-serif; background: #111; z-index: 10;
+  }
+  #corner {                        /* hidden experimenter button: HOLD 2 s to stop + save */
+    position: fixed; top: 0; left: 0; width: 80px; height: 80px; z-index: 5;
+  }
+</style>
+</head>
+
+<body>
+  <div id="stage">
+    <div id="dot"></div>
+  </div>
+  <div id="corner"></div>
+  <div id="start">Tap to start</div>
+
+<script>
+/* =====================================================
+   SETTINGS - change these without touching the logic
+   ===================================================== */
+const CONFIG = {
+  DOT_DIAMETER_PX: 100,        // size of the target
+  DOT_COLOR:       "#ff0000",
+  REWARD_COLOR:    "#0ff000",
+  MARGIN_PX:       120,        // keep dot this far from screen edges
+  HOLD_MS:         500,        // finger must stay on the dot this long before reward (0 = reward on touch)
+  REWARD_MS:       600,        // how long the reward feedback lasts
+  ITI_MS:          1500,       // blank time between trials
+  MAX_TRIALS:      0,          // 0 = run until stopped
+  REWARD_URL:      null,       // e.g. "/reward" -> server fires the juice pump
+  USE_ARDUINO:     true,       // LED on for REWARD_MS on each correct trial (Web Serial, same as arduino_test.html)
+  ARDUINO_BAUD:    9600,       // must match Serial.begin(...) in the Arduino sketch
+  LOG_URL:         "/log",     // where each trial is POSTed (set null to disable)
+  SUBJECT:         "monkeyX"   // goes into the data file
+};
+
+/* =====================================================
+   STATE
+   ===================================================== */
+const dot   = document.getElementById("dot");
+const stage = document.getElementById("stage");
+let trials = [];               // one entry per trial
+let trialNum = 0;
+let current = null;            // info about the trial currently on screen
+let hold = null;               // finger currently held on the dot (waiting for HOLD_MS)
+let running = false;
+let audioCtx = null;
+let wakeLock = null;
+let arduino = null;            // serial writer to the Arduino (null = not connected)
+
+/* =====================================================
+   TRIAL LOGIC
+   ===================================================== */
+function startTrial() {
+  if (!running) return;
+  if (CONFIG.MAX_TRIALS && trialNum >= CONFIG.MAX_TRIALS) { endSession(); return; }
+
+  trialNum++;
+  const d = CONFIG.DOT_DIAMETER_PX, m = CONFIG.MARGIN_PX;
+  const x = m + Math.random() * (window.innerWidth  - 2 * m - d);   // left edge of dot
+  const y = m + Math.random() * (window.innerHeight - 2 * m - d);   // top edge of dot
+
+  dot.style.width  = d + "px";
+  dot.style.height = d + "px";
+  dot.style.background = CONFIG.DOT_COLOR;
+  dot.style.left = x + "px";
+  dot.style.top  = y + "px";
+  dot.style.display = "block";
+
+  current = {
+    trial: trialNum,
+    dot_x: Math.round(x + d / 2),          // dot CENTER, pixels
+    dot_y: Math.round(y + d / 2),
+    t_onset: performance.now(),
+    misses: 0,
+    early_releases: 0                      // touched the dot but let go before HOLD_MS
+  };
+}
+
+function onDot(e) {
+  const dx = e.clientX - current.dot_x;
+  const dy = e.clientY - current.dot_y;
+  return Math.hypot(dx, dy) <= CONFIG.DOT_DIAMETER_PX / 2;
+}
+
+/* Every touch anywhere on the screen arrives here */
+stage.addEventListener("pointerdown", (e) => {
+  if (!running || !current || hold) return;  // ignore touches when no dot is showing / already holding
+
+  if (onDot(e)) {
+    // Start the hold; reward only fires if the finger stays on the dot for HOLD_MS
+    hold = {
+      pointerId: e.pointerId,
+      t_down: performance.now(),
+      touch_x: Math.round(e.clientX), touch_y: Math.round(e.clientY),
+      timer: setTimeout(completeHold, CONFIG.HOLD_MS)
+    };
+  } else {
+    current.misses++;                      // touched the background
+  }
+});
+
+/* Finger lifted or slid off the dot before HOLD_MS -> no reward, dot stays up */
+function breakHold(e) {
+  if (!hold || e.pointerId !== hold.pointerId) return;
+  if (e.type === "pointermove" && onDot(e)) return;   // still on the dot
+  clearTimeout(hold.timer);
+  current.early_releases++;
+  hold = null;
+}
+window.addEventListener("pointermove",   breakHold);
+window.addEventListener("pointerup",     breakHold);
+window.addEventListener("pointercancel", breakHold);
+
+function completeHold() {
+  const rec = {
+    subject: CONFIG.SUBJECT,
+    trial: current.trial,
+    timestamp: new Date().toISOString(),
+    dot_x: current.dot_x, dot_y: current.dot_y,
+    touch_x: hold.touch_x, touch_y: hold.touch_y,
+    rt_ms: Math.round(hold.t_down - current.t_onset),   // onset -> finger down on the dot
+    hold_ms: CONFIG.HOLD_MS,
+    misses_before_hit: current.misses,
+    early_releases: current.early_releases,
+    screen_w: window.innerWidth, screen_h: window.innerHeight
+  };
+  current = null;                          // block double-counting
+  hold = null;
+  trials.push(rec);
+  saveBackup();
+  sendLog(rec);
+  giveReward();
+  setTimeout(startTrial, CONFIG.REWARD_MS + CONFIG.ITI_MS);
+}
+
+/* =====================================================
+   REWARD
+   ===================================================== */
+function giveReward() {
+  //beep();                                              // sound
+  //stage.style.background = "#103010";                  // brief green flash
+  dot.style.display = "block";
+  dot.style.background = CONFIG.REWARD_COLOR;
+  setTimeout(() => {
+    dot.style.background = CONFIG.DOT_COLOR;
+    dot.style.display = "none";
+    stage.style.background = "black";
+  }, CONFIG.REWARD_MS);
+  //setTimeout(() => stage.style.background = "black", CONFIG.REWARD_MS);
+  arduinoSend("1");                                    // LED on for the reward duration
+  setTimeout(() => arduinoSend("0"), CONFIG.REWARD_MS);
+  if (CONFIG.REWARD_URL) {                             // real reward (pump) via server
+    fetch(CONFIG.REWARD_URL, { method: "POST" }).catch(err => console.log("reward fail", err));
+  }
+}
+
+/* Arduino LED over USB serial: '1' = LED on, '0' = LED off (same as arduino_test.html) */
+async function connectArduino() {
+  if (!CONFIG.USE_ARDUINO || !navigator.serial) return;
+  try {
+    // Reuse a port this page was already given permission for; otherwise show the picker
+    const ports = await navigator.serial.getPorts();
+    const port = ports[0] || await navigator.serial.requestPort();
+    await port.open({ baudRate: CONFIG.ARDUINO_BAUD });
+    arduino = port.writable.getWriter();
+  } catch (e) { console.log("arduino not connected", e); }
+}
+
+function arduinoSend(text) {
+  if (!arduino) return;
+  arduino.write(new TextEncoder().encode(text)).catch(err => console.log("arduino write fail", err));
+}
+
+function beep() {
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.frequency.value = 880;
+  g.gain.value = 0.3;
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(); o.stop(audioCtx.currentTime + 0.2);
+}
+
+/* =====================================================
+   DATA SAVING
+   ===================================================== */
+function sendLog(rec) {
+  if (!CONFIG.LOG_URL) return;
+  fetch(CONFIG.LOG_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(rec)
+  }).catch(err => console.log("log fail (data still in backup)", err));
+}
+
+function saveBackup() {                    // survives a page reload
+  try { localStorage.setItem("dot_task_trials", JSON.stringify(trials)); } catch (e) {}
+}
+
+function downloadCSV() {
+  if (!trials.length) return;
+  const cols = Object.keys(trials[0]);
+  const rows = trials.map(t => cols.map(c => t[c]).join(","));
+  const blob = new Blob([cols.join(",") + "\n" + rows.join("\n")], { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = CONFIG.SUBJECT + "_" + new Date().toISOString().replace(/[:.]/g, "-") + ".csv";
+  a.click();
+}
+
+/* =====================================================
+   START / STOP
+   ===================================================== */
+document.getElementById("start").addEventListener("pointerdown", async () => {
+  // Browsers only allow sound + fullscreen after a user touch, so we do it here.
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  await connectArduino();                                  // needs a user touch the first time (port picker)
+  try { await document.documentElement.requestFullscreen(); } catch (e) {}
+  try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}  // keep screen on (needs https or localhost)
+  document.getElementById("start").style.display = "none";
+  running = true;
+  setTimeout(startTrial, 500);
+});
+
+function endSession() {
+  running = false;
+  if (hold) { clearTimeout(hold.timer); hold = null; }
+  arduinoSend("0");
+  dot.style.display = "none";
+  if (wakeLock) wakeLock.release();
+  downloadCSV();
+}
+
+/* Experimenter exit: hold top-left corner for 2 seconds */
+let holdTimer = null;
+const corner = document.getElementById("corner");
+corner.addEventListener("pointerdown", () => { holdTimer = setTimeout(endSession, 2000); });
+corner.addEventListener("pointerup",   () => clearTimeout(holdTimer));
+corner.addEventListener("pointerleave",() => clearTimeout(holdTimer));
+
+/* Long-presses on the dot shouldn't open a context menu (Android/Chrome) */
+document.addEventListener("contextmenu", (e) => e.preventDefault());
+</script>
+</body>
+</html>

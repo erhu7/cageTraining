@@ -1,0 +1,68 @@
+<!doctype html>  <!-- Tells the browser this is a modern HTML5 page -->
+<html>
+<body>
+
+  <!-- Three buttons. The id attribute is a unique name that lets JavaScript
+       find each one. -->
+
+  <!-- The connect button is enabled from the start, because the user must click
+       it first to choose which USB device to talk to. -->
+  <button id="connectBtn">Connect to Arduino</button>
+
+  <!-- The LED buttons start "disabled" (greyed out and unclickable) because
+       there is no connection to send commands over yet. -->
+  <button id="ledOn" disabled>LED on</button>
+  <button id="ledOff" disabled>LED off</button>
+
+  <script>
+    // Declare a variable named "writer" with no value yet. It will later hold
+    // the object we use to send bytes to the Arduino. It is declared out here
+    // (outside any function) so that every button handler can use it.
+    // "let" means the value can be changed later.
+    let writer;
+
+    // Find the connect button by its id, and assign a function to its onclick
+    // property. That function runs every time the button is clicked.
+    // "async" marks the function as one that can "await" slow operations
+    // (like waiting for the user to pick a port) without freezing the page.
+    document.getElementById('connectBtn').onclick = async () => {
+
+      // Ask the browser to show its built-in popup listing available serial
+      // devices. "await" pauses THIS function until the user picks one (or
+      // cancels). This must be triggered by a click, as a browser security
+      // rule: pages can't grab your USB devices without you doing something.
+      // The result, "port", is an object representing the chosen device.
+      const port = await navigator.serial.requestPort();
+
+      // Open the connection at 9600 baud. This number MUST match the
+      // Serial.begin(9600) in the Arduino sketch. Wait until it's open.
+      await port.open({ baudRate: 9600 });
+
+      // port.writable is a stream of data going TO the Arduino.
+      // getWriter() locks that stream and hands us a "writer" that we can
+      // push bytes into. We save it in the variable declared earlier.
+      writer = port.writable.getWriter();
+
+      // The connection is ready, so enable the two LED buttons.
+      // "ledOn" and "ledOff" work here because browsers automatically create
+      // a JavaScript variable for every element that has an id.
+      ledOn.disabled = false;
+      ledOff.disabled = false;
+    };
+
+    // Define a small helper function named "send" that takes some text.
+    const send = (text) =>
+      // TextEncoder converts a string like "1" into raw bytes (a Uint8Array),
+      // because serial ports carry bytes, not text.
+      // writer.write() then queues those bytes to go out over USB.
+      writer.write(new TextEncoder().encode(text));
+
+    // When "LED on" is clicked, send the character '1' (the sketch turns the LED on).
+    document.getElementById('ledOn').onclick  = () => send('1');
+
+    // When "LED off" is clicked, send the character '0' (the sketch turns the LED off).
+    document.getElementById('ledOff').onclick = () => send('0');
+  </script>
+
+</body>
+</html>
